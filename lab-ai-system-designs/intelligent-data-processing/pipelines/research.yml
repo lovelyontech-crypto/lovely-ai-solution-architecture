@@ -1,0 +1,130 @@
+# Research pipeline: 3 scheduled weekday runs + manual dispatch (BRD §15.5, FR-150 to FR-159).
+# Copy to .github/workflows/research.yml in the platform repository (OD-28).
+# Before use, replace the action version tags with full commit SHAs (FR-172, §15.7).
+name: research
+
+on:
+  schedule:
+    - cron: "30 3 * * 1-5"   # 09:00 IST morning (previous completed session)
+    - cron: "30 7 * * 1-5"   # 13:00 IST midday (delayed intraday, incomplete session)
+    - cron: "30 10 * * 1-5"  # 16:00 IST evening (provisional unless final close confirmed)
+  workflow_dispatch:
+    inputs:
+      scope:
+        type: choice
+        options: [universe, watchlist, symbols]
+        default: universe
+      symbols:
+        type: string
+        default: ""
+        description: Comma-separated NSE symbols (validated against the configured universe)
+      mode:
+        type: choice
+        options: [full_research, data_only, report_only]
+        default: full_research
+      horizons:
+        type: string
+        default: "1M,3M,6M,12M"
+      report_format:
+        type: choice
+        options: [html, html_csv]
+        default: html_csv
+      full_refresh:
+        type: boolean
+        default: false
+      refresh_reason:
+        type: string
+        default: ""
+        description: Required when full_refresh is true (FR-157)
+
+concurrency:
+  group: research-data
+  cancel-in-progress: false   # never cancel an in-progress data write (FR-154)
+
+permissions:
+  contents: write             # only to commit to the data branch
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60       # NFR-101 hard timeout
+    steps:
+      - name: Checkout code (main)
+        uses: actions/checkout@v4
+
+      - name: Checkout data branch
+        uses: actions/checkout@v4
+        with:
+          ref: data
+          path: data
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: ".python-version"
+          cache: pip
+
+      - name: Install pinned dependencies
+        run: pip install --require-hashes -r requirements.lock
+
+      - name: Provider preflight (endpoints, token expiry, licence flags)
+        # Reads config/platform.yaml, calls each enabled provider's cheapest endpoint
+        # (Upstox: instrument master + /v2/market/holidays), checks UPSTOX_TOKEN_ISSUED_ON
+        # (warns at 30 days before the 1-year expiry), and fails fast on licence_confirmed: false.
+        env:
+          UPSTOX_ANALYTICS_TOKEN: ${{ secrets.UPSTOX_ANALYTICS_TOKEN }}
+          UPSTOX_TOKEN_ISSUED_ON: ${{ vars.UPSTOX_TOKEN_ISSUED_ON }}
+        run: python -m research_platform.providers.preflight --config config/platform.yaml
+
+      - name: Run research pipeline (steps 3-13 of BRD §15.5.3)
+        env:
+          # Dispatch inputs are passed via env, never interpolated into the shell (§15.7 Inputs).
+          TRIGGER: ${{ github.event_name }}
+          SCHEDULE_CRON: ${{ github.event.schedule }}
+          IN_SCOPE: ${{ inputs.scope }}
+          IN_SYMBOLS: ${{ inputs.symbols }}
+          IN_MODE: ${{ inputs.mode }}
+          IN_HORIZONS: ${{ inputs.horizons }}
+          IN_REPORT_FORMAT: ${{ inputs.report_format }}
+          IN_FULL_REFRESH: ${{ inputs.full_refresh }}
+          IN_REFRESH_REASON: ${{ inputs.refresh_reason }}
+          RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          # Endpoints come from config/platform.yaml (providers.*); only credentials are injected here.
+          UPSTOX_ANALYTICS_TOKEN: ${{ secrets.UPSTOX_ANALYTICS_TOKEN }}   # https://api.upstox.com/v2|v3
+          MARKET_DATA_API_KEY: ${{ secrets.MARKET_DATA_API_KEY }}         # licensed vendor (OD-02), when selected
+          FUNDAMENTALS_API_KEY: ${{ secrets.FUNDAMENTALS_API_KEY }}
+          MOSPI_USERNAME: ${{ secrets.MOSPI_USERNAME }}                   # https://api.mospi.gov.in
+          MOSPI_PASSWORD: ${{ secrets.MOSPI_PASSWORD }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          GMAIL_SENDER: ${{ secrets.GMAIL_SENDER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          REPORT_RECIPIENT: ${{ secrets.REPORT_RECIPIENT }}
+        run: python -m research_platform.pipeline --data-dir data --config config/platform.yaml
+
+      - name: Commit and push data branch (step 14, FR-156)
+        if: always()
+        working-directory: data
+        env:
+          RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          git config user.name "research-bot"
+          git config user.email "research-bot@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No data changes; nothing committed."
+            exit 0
+          fi
+          git commit -m "data: run ${RUN_ID}"
+          for attempt in 1 2; do
+            if git push origin HEAD:data; then exit 0; fi
+            echo "Push rejected; re-reading data branch and re-merging (FR-154)."
+            git fetch origin data
+            python -m research_platform.persist.remerge --data-dir . --onto origin/data || break
+          done
+          python -m research_platform.persist.mark_not_persisted --run-id "${RUN_ID}"
+          exit 1
+
+      - name: Job summary
+        if: always()
+        run: python -m research_platform.observability.job_summary --data-dir data >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,18 @@
+# Edge-Case Design Patterns (developer view)
+
+For each category that applies to a change, choose the pattern and write the test that proves it. Domain additions come from the project's `engineering-profile.md`.
+
+| Category | Typical cases | Design pattern |
+|---|---|---|
+| **Input values** | empty, null, zero, negative, NaN/inf, boundaries, wrong types, duplicates, Unicode/Devanagari, CSV delimiters in fields, BOM | Parse into typed objects at the boundary (`pydantic`); explicit allow-lists; `Decimal` or tolerances for money; NFC-normalise text; reject or return "insufficient data" with the field named, never coerce silently |
+| **Time and calendars** | UTC vs IST, holidays, special sessions, month/fiscal-year ends, leap days, late schedules, future timestamps, incomplete current period | Store UTC, display local; trading dates from the exchange calendar only; inject a clock; mark current-period data `is_complete=false`; point-in-time joins on publication timestamp |
+| **Data shape** | empty/single/huge collections, gaps, overlaps, out-of-order, lookback longer than history, schema drift | Sort and dedupe on the natural key; explicit minimum-history checks; schema version in every file and a hard stop on mismatch; stream or chunk large inputs |
+| **External dependencies** | timeouts, resets, 401/403/404/429/5xx, 200-with-error, empty or truncated responses, pagination ends, wrong-entity responses, schema change, expired credentials | Adapter returns a status (`ok/partial/rate_limited/auth_failed/unavailable/invalid_response`); timeout + bounded exponential backoff with jitter; honour `Retry-After`; validate before use; never replace stored data with a shorter response; preflight credential checks |
+| **State and storage** | crash mid-write, disk full, corrupted or missing files, stale index | Temp file → fsync → checksum → atomic rename; manifest updated only after success; backups before bulk change; checksum verification on read |
+| **Concurrency and re-runs** | two runs at once, manual during scheduled, retried run, push conflict | Single writer via concurrency group; idempotency key on business identity (run ID, not attempt); fast-forward push with one re-merge; dedupe on natural keys |
+| **Market domain** | corporate actions, dual listing, circuit/halt, illiquid, negative denominators, restatements, lot/expiry changes, IV unsolvable, stop on wrong side, quantity rounds to zero | Adjustment-factor tables with raw and adjusted series kept separate; ISIN as key; "not meaningful" results with reason; contract data from the daily master only; validate trade inputs and reject with a message |
+| **AI / ML** | insufficient history, leakage, unapproved or mismatched model, misaligned features, LLM invented numbers, prompt injection, invalid JSON, non-determinism | Registry check before load; feature-set version match; as-of alignment check; LLM sees only a fact sheet; deterministic citation gate; schema-validated output with one regeneration then template fallback; temperature 0 |
+| **Security and privacy** | secrets or emails in logs, injection (shell, path, CSV formula), unauthorised trigger | Central masking log filter; never build commands/paths from raw input; prefix CSV cells starting with `= + - @`; permission checks at entry points |
+| **Operations** | first run, long downtime gap, invalid or empty config, near limits, notification failure after success | Config schema validation before any work; resumable checkpoints; budget checks with early warnings; record delivery status separately from processing status |
+
+Write down, in the work item report, which rows applied and the test name for each.

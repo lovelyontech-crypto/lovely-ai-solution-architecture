@@ -1,0 +1,154 @@
+# Provider and endpoint registry read by every pipeline run (BRD FR-142, FR-143, FR-170).
+# Copy to config/platform.yaml in the platform repository. Non-secret values only:
+# credentials are referenced by the NAME of a GitHub Actions secret, never by value.
+#
+# Verification status of each endpoint is recorded in `verified`. A dataset whose provider has
+# `licence_confirmed: false` is never fetched in production (FR-143); the run reports it as a blocker.
+
+schema_version: 1
+
+universe:
+  tier: T1                      # NIFTY 100 (BRD §6.1)
+  constituents_source: index_licence   # from the index feed, never hardcoded
+
+schedule:
+  timezone: Asia/Kolkata
+  slots: ["09:00", "13:00", "16:00"]   # matches research.yml crons 30 3 / 30 7 / 30 10 UTC
+  late_tolerance_minutes: 30
+
+providers:
+
+  # ---------------------------------------------------------------------------------------------
+  # PRIMARY MARKET DATA (v1.0, sponsor-only use): Upstox Developer API, REST, read-only
+  # Chosen because the Analytics Token is valid for 1 year with no daily login and needs
+  # no static IP for market-data APIs, so unattended GitHub-hosted runners can call it.
+  # Licence: broker API data is for the account holder's own use (BRD §14.5). Allowed only while
+  # OD-22 = sponsor-only. Written confirmation of terms required before first production run.
+  # ---------------------------------------------------------------------------------------------
+  upstox:
+    transport: rest
+    base_url_v2: https://api.upstox.com/v2
+    base_url_v3: https://api.upstox.com/v3
+    auth:
+      type: bearer
+      secret_name: UPSTOX_ANALYTICS_TOKEN      # generated in Developer Apps > Analytics tab
+      token_issued_on_variable: UPSTOX_TOKEN_ISSUED_ON   # vars.*; alert 30 days before 1-year expiry
+    headers:
+      Accept: application/json
+    licence_confirmed: false                   # flip only after written confirmation (OD-02/OD-22)
+    timeout_seconds: 30
+    retries: 5                                 # exponential backoff with jitter (§14.4.6)
+    rate_limit_doc: https://upstox.com/developer/api-documentation/rate-limiting
+    endpoints:
+      instrument_master:
+        url: https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz
+        auth: none                             # CDN file, refreshed daily ~06:00 IST
+        note: excludes delisted/expired instruments; keep history in our own security master (FR-001)
+        verified: true
+      daily_candles:
+        method: GET
+        path: /v3/historical-candle/{instrument_key}/days/1/{to_date}/{from_date}
+        limits: daily history from Jan 2000; max 1 decade per request
+        used_for: [raw/daily, initial 10-year download (FR-130), incremental gaps (FR-133)]
+        verified: true
+      full_market_quote:
+        method: GET
+        path: /v3/market-quote/quotes          # query: instrument_key (up to 500 per call)
+        used_for: [13:00 intraday snapshot (OD-25), 16:00 provisional close]
+        verified: true
+      market_holidays:
+        method: GET
+        path: /v2/market/holidays              # optional /{date}
+        used_for: [trading calendar (FR-133, FR-159)]
+        caveat: special sessions (e.g. Muhurat) reported inconsistent; cross-check exchange holiday circular
+        verified: true
+      fundamentals:
+        status: unverified                     # Upstox docs list a Fundamentals category; paths not yet confirmed
+        fallback: fundamentals_vendor
+      news:
+        status: unverified
+        fallback: news_vendor
+
+  # ---------------------------------------------------------------------------------------------
+  # LICENSED VENDORS (required before any recipient other than the sponsor, OD-02/OD-22)
+  # Not selected yet. The adapter interface is identical; only these blocks change.
+  # ---------------------------------------------------------------------------------------------
+  market_data_vendor:
+    transport: rest
+    base_url: null                             # set after vendor RFP (OD-02)
+    auth: {type: api_key, secret_name: MARKET_DATA_API_KEY}
+    licence_confirmed: false
+  fundamentals_vendor:
+    transport: rest
+    base_url: null                             # point-in-time statements, shareholding (FR-020, FR-024)
+    auth: {type: api_key, secret_name: FUNDAMENTALS_API_KEY}
+    licence_confirmed: false
+  news_vendor:
+    transport: rest
+    base_url: null                             # Phase 2 (D-03); no scraping (C-05)
+    auth: {type: api_key, secret_name: NEWS_API_KEY}
+    licence_confirmed: false
+
+  # ---------------------------------------------------------------------------------------------
+  # OFFICIAL MACRO (FR-041, Should)
+  # ---------------------------------------------------------------------------------------------
+  mospi:
+    transport: rest                            # primary for scheduled runs (deterministic)
+    base_url: https://api.mospi.gov.in
+    auth:
+      type: login_token                        # POST /api/login; token valid 30 minutes
+      login_path: /api/login
+      secret_name_user: MOSPI_USERNAME
+      secret_name_password: MOSPI_PASSWORD
+      note: without a token only the first 10 records are returned
+    datasets: [CPI, IIP, NAS_GDP, WPI]
+    endpoint_reference: https://api.mospi.gov.in/API/CPI%20API%20User%20Manual.pdf
+    licence_confirmed: false                   # check portal terms and attribution (§14.2)
+    verified: partial                          # base URL and auth verified; data paths from the manual
+  mospi_mcp:
+    transport: mcp_streamable_http             # optional alternative to the REST API above
+    url: https://mcp.mospi.gov.in/
+    tools_in_order: [list_datasets, get_indicators, get_metadata, get_data]
+    enabled: false                             # enable only after an auth and terms check
+    verified: partial                          # URL and tool names from the published server listing
+  rbi_dbie:
+    transport: manual_reviewed_file            # no documented API found
+    portal: https://data.rbi.org.in
+    file: config/macro/rbi_rates.csv           # repo rate, 10Y G-sec, 91-day T-bill
+    process: entered by operator, second-person check via PR review (BRD §14.2 fallback, V18)
+  fbil:
+    transport: manual_reviewed_file            # no documented API found
+    portal: https://www.fbil.org.in
+    file: config/macro/fbil_usdinr.csv         # USD/INR reference rate, published ~13:00 IST weekdays
+    process: same as rbi_dbie
+
+  # ---------------------------------------------------------------------------------------------
+  # DELIVERY AND AI
+  # ---------------------------------------------------------------------------------------------
+  gmail_smtp:
+    host: smtp.gmail.com
+    port: 587
+    tls: starttls
+    auth: {secret_name_user: GMAIL_SENDER, secret_name_password: GMAIL_APP_PASSWORD}
+    recipients_secret: REPORT_RECIPIENT
+  llm:
+    transport: rest
+    base_url: null                             # provider decided under OD-12
+    auth: {type: api_key, secret_name: LLM_API_KEY}
+    temperature: 0
+    daily_token_cap_variable: LLM_DAILY_TOKEN_CAP
+
+# Which provider serves each dataset. The pipeline reads this; nothing is hardcoded in code.
+dataset_routing:
+  security_master:      {primary: upstox.instrument_master}
+  daily_equity:         {primary: upstox.daily_candles,      fallback: market_data_vendor}
+  intraday_snapshot:    {primary: upstox.full_market_quote,  fallback: none}
+  index_levels:         {primary: upstox.daily_candles,      note: index instrument keys from instrument master}
+  trading_calendar:     {primary: upstox.market_holidays,    cross_check: exchange holiday circular}
+  corporate_actions:    {primary: market_data_vendor,        status: blocked_until_OD-02}
+  index_constituents:   {primary: market_data_vendor,        status: blocked_until_OD-02}
+  fundamentals:         {primary: fundamentals_vendor,       status: blocked_until_OD-02}
+  derivatives_contracts: {primary: upstox.instrument_master,  note: lot size and expiry from master (FR-080)}
+  macro_cpi_gdp_iip:    {primary: mospi,                     alternative: mospi_mcp}
+  macro_rates_fx:       {primary: rbi_dbie / fbil manual files}
+  news:                 {primary: news_vendor,               status: phase_2}

@@ -1,0 +1,78 @@
+# Monthly / drift-triggered model training and selection (BRD FR-140, FR-180 to FR-182, §10.9).
+# Runs outside the three research slots. It never promotes a model: it opens a pull request that
+# a quant lead must approve (FR-175, FR-181).
+# Before use, replace the action version tags with full commit SHAs (FR-172).
+name: model-training
+
+on:
+  schedule:
+    - cron: "30 20 1 * *"    # 02:00 IST on the 2nd of each month, outside research slots
+  workflow_dispatch:
+    inputs:
+      trigger_reason:
+        type: choice
+        options: [scheduled, coverage_drift, feature_drift, manual]
+        default: manual
+
+concurrency:
+  group: model-training
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  train-and-select:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout data branch (read-only use)
+        uses: actions/checkout@v4
+        with:
+          ref: data
+          path: data
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: ".python-version"
+          cache: pip
+
+      - run: pip install --require-hashes -r requirements.lock
+
+      - name: Leakage audit (TST-FC-01)
+        run: python -m research_platform.models.leakage_audit --data-dir data
+
+      - name: Candidate evaluation (purged walk-forward, Optuna, CQR)
+        env:
+          TRIGGER_REASON: ${{ inputs.trigger_reason || 'scheduled' }}
+        run: |
+          python -m research_platform.models.select \
+            --data-dir data \
+            --candidates baselines,elastic_net_qr,lightgbm_qr,lightgbm_lambdarank \
+            --horizons 1M,3M,6M,12M \
+            --holdout-years 3 \
+            --out selection_report
+
+      - name: Publication gate (DM test + FDR, coverage 75-85%)
+        run: python -m research_platform.models.gate --report selection_report --registry models/model_registry.json
+
+      - name: Open registry pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BRANCH="model-update/${{ github.run_id }}"
+          git switch -c "$BRANCH"
+          git add models/model_registry.json selection_report/
+          if git diff --cached --quiet; then
+            echo "No candidate passed the gate; registry unchanged (status model_not_validated)."
+            exit 0
+          fi
+          git -c user.name=research-bot -c user.email=research-bot@users.noreply.github.com \
+            commit -m "models: candidate registry update from run ${{ github.run_id }}"
+          git push origin "$BRANCH"
+          gh pr create --base main --head "$BRANCH" \
+            --title "Model registry update (run ${{ github.run_id }})" \
+            --body "Selection report attached. Requires quant lead and compliance approval before merge (FR-181)."

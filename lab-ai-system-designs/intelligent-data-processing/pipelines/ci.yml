@@ -1,0 +1,43 @@
+# Continuous integration on every pull request to main (BRD §19, NFR-109, FR-171).
+# Tests use isolated fixtures written outside data/ (§5.6); no live provider, LLM or Gmail calls.
+# Before use, replace the action version tags with full commit SHAs (FR-172).
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: ".python-version"
+          cache: pip
+      - run: pip install --require-hashes -r requirements.lock
+
+      - name: Lint and type check
+        run: |
+          ruff check .
+          mypy research_platform
+
+      - name: Golden calculation tests (TST-CALC, TST-DER, TST-RISK)
+        run: pytest tests/golden -q
+
+      - name: Historical store tests A to J with recording mock provider (TST-HIST)
+        run: pytest tests/historical_store -q
+
+      - name: AI safety suites (TST-AI-01 to TST-AI-05, TST-DER-03)
+        run: pytest tests/ai_safety -q   # recorded LLM responses only; no live API calls in CI
+
+      - name: Engineering principles (TST-PRIN-01)
+        run: python -m research_platform.checks.principles   # no hardcoded prices, lot sizes, emails, fixtures under data/
+
+      - name: Coverage gate (NFR-109)
+        run: pytest --cov=research_platform --cov-fail-under=80 -q
